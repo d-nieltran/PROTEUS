@@ -1,6 +1,49 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as THREE from "three";
 import { ScatterChart, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, BarChart, Bar, Cell, CartesianGrid } from "recharts";
+import ScoringWorker from "./scoring-worker.js?worker";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORKER POOL + COMPOUND BUFFER
+// ═══════════════════════════════════════════════════════════════════════════
+function createWorkerPool(count) {
+  const workers = [];
+  const pending = new Map();
+  let nextId = 0;
+  for (let i = 0; i < count; i++) {
+    const w = new ScoringWorker();
+    w.onmessage = (e) => {
+      const resolve = pending.get(e.data.id);
+      if (resolve) { pending.delete(e.data.id); resolve(e.data); }
+    };
+    workers.push(w);
+  }
+  function dispatch(workerIdx, msg) {
+    const id = nextId++;
+    msg.id = id;
+    return new Promise((resolve) => {
+      pending.set(id, resolve);
+      workers[workerIdx % workers.length].postMessage(msg);
+    });
+  }
+  function dispatchAll(msg) {
+    // Distribute work across all workers
+    return dispatch(nextId % workers.length, msg);
+  }
+  function terminate() { workers.forEach(w => w.terminate()); }
+  return { dispatch, dispatchAll, terminate, count: workers.length };
+}
+
+function getOptimalConfig(cores, memory, gpuLimits) {
+  // Auto-scale based on detected hardware
+  const mem = parseFloat(memory) || 8;
+  if (cores >= 24) return { batchSize: 25000, prefetch: 6, workerCount: cores - 2 };
+  if (cores >= 14) return { batchSize: 10000, prefetch: 5, workerCount: cores - 2 };
+  if (cores >= 12) return { batchSize: 5000, prefetch: 4, workerCount: cores - 2 };
+  if (cores >= 10) return { batchSize: 5000, prefetch: 4, workerCount: cores - 2 };
+  if (cores >= 8) return { batchSize: 2000, prefetch: 3, workerCount: Math.max(2, cores - 2) };
+  return { batchSize: 1000, prefetch: 2, workerCount: Math.max(1, cores - 1) };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TARGETS — real PDB co-crystal structures
@@ -101,6 +144,29 @@ function getFallback(pdbId){
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPOUND FETCHING
 // ═══════════════════════════════════════════════════════════════════════════
+async function fetchRawMolecules(offset=0,limit=1000){
+  const proxyUrl=`/api/chembl?offset=${offset}&limit=${Math.min(limit,1000)}`;
+  const directUrl=`https://www.ebi.ac.uk/chembl/api/data/molecule.json?limit=${Math.min(limit,1000)}&offset=${offset}&molecule_properties__full_mwt__lte=550&molecule_properties__full_mwt__gte=200&molecule_properties__alogp__gte=-1&molecule_properties__alogp__lte=6&molecule_properties__hbd__lte=5&molecule_properties__hba__lte=10&molecule_structures__canonical_smiles__isnull=false`;
+  for(const url of [proxyUrl,directUrl]){
+    try{const res=await fetch(url,{headers:{Accept:"application/json"}});if(!res.ok)continue;const data=await res.json();if(data?.molecules?.length>0)return data;}catch{continue;}
+  }
+  return null;
+}
+
+function processMoleculeMain(m){
+  const p=m.molecule_properties;if(!p)return null;
+  const smiles=m.molecule_structures?.canonical_smiles;if(!smiles)return null;
+  const features=extractFeaturesFromSMILES(smiles,p);
+  if(features.length<2)return null;
+  return {id:m.molecule_chembl_id,name:m.pref_name||m.molecule_chembl_id,smiles,
+    mw:+parseFloat(p.full_mwt).toFixed(1),hbd:parseInt(p.hbd)||0,hba:parseInt(p.hba)||0,
+    logP:+parseFloat(p.alogp).toFixed(2),tpsa:+parseFloat(p.psa).toFixed(1),
+    rotBonds:parseInt(p.rtb)||0,aromRings:parseInt(p.aromatic_rings)||0,
+    heavyAtoms:parseInt(p.heavy_atoms)||0,features,
+    lipinski:(parseFloat(p.full_mwt)||0)<=500&&(parseInt(p.hbd)||0)<=5&&(parseInt(p.hba)||0)<=10&&(parseFloat(p.alogp)||0)<=5,
+    source:"ChEMBL"};
+}
+
 async function fetchRealCompounds(offset=0,limit=100){
   const proxyUrl=`/api/chembl?offset=${offset}&limit=${limit}`;
   const directUrl=`https://www.ebi.ac.uk/chembl/api/data/molecule.json?limit=${limit}&offset=${offset}&molecule_properties__full_mwt__lte=550&molecule_properties__full_mwt__gte=200&molecule_properties__alogp__gte=-1&molecule_properties__alogp__lte=6&molecule_properties__hbd__lte=5&molecule_properties__hba__lte=10&molecule_structures__canonical_smiles__isnull=false`;
@@ -201,9 +267,16 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       best=max(best,ts*exp(-(dx*dx+dy*dy+dz*dz)/4.0)*pf.w);}s+=best;}
   if(c.lip==0u){s*=0.7;}s*=max(0.3,1.0-abs(c.mw-350.0)/400.0);s-=c.tpsa*0.003;s-=c.rot*0.08;sc[ci]=s;}`;
 
+let _cachedPipeline = null;
+let _cachedModule = null;
+function getGPUPipeline(device) {
+  if (!_cachedModule) _cachedModule = device.createShaderModule({ code: SCORING_SHADER });
+  if (!_cachedPipeline) _cachedPipeline = device.createComputePipeline({ layout: "auto", compute: { module: _cachedModule, entryPoint: "main" } });
+  return _cachedPipeline;
+}
+
 async function scoreGPU(device,compounds,pharmacophore){
-  const mod=device.createShaderModule({code:SCORING_SHADER});
-  const pipe=device.createComputePipeline({layout:"auto",compute:{module:mod,entryPoint:"main"}});
+  const pipe = getGPUPipeline(device);
   const nC=compounds.length,nP=pharmacophore.features.length;
   const pData=new Float32Array(nP*8);
   for(let i=0;i<nP;i++){const p=pharmacophore.features[i],o=i*8;
@@ -922,7 +995,7 @@ export default function ProteusVS() {
   const [autoMode, setAutoMode] = useState(false);
   const autoRef = useRef(false);
   const [batchId, setBatchId] = useState(0);
-  const [batchSz, setBatchSz] = useState(100);
+  const [batchSz, setBatchSz] = useState(2000);
   const [totalScr, setTotalScr] = useState(0);
   const [sessScr, setSessScr] = useState(0);
   const [topHits, setTopHits] = useState([]);
@@ -942,8 +1015,12 @@ export default function ProteusVS() {
   const [structFreshness, setStructFreshness] = useState({});
   const [utilization, setUtilization] = useState({ gpuPct: 0, cpuPct: 0, scoreMs: 0, fetchMs: 0, totalMs: 0, idle: 100 });
   const [screenEvent, setScreenEvent] = useState(null); // {type, data, ts}
+  const [workerCount, setWorkerCount] = useState(0);
+  const [optimalConfig, setOptimalConfig] = useState(null);
   const utilRef = useRef({ cycleStart: 0, fetchEnd: 0, scoreEnd: 0 });
   const adapterRef = useRef(null);
+  const workerPoolRef = useRef(null);
+  const compoundBufferRef = useRef([]); // pre-fetched compound batches ready to score
   const addLog = useCallback((t, m) => setLog(l => [...l.slice(-60), { t, m, ts: Date.now() }]), []);
   const logEnd = useRef(null);
   useEffect(() => { logEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [log]);
@@ -993,10 +1070,26 @@ export default function ProteusVS() {
         } catch { setGpu(false); }
       } else { setGpu(false); }
 
-      // Hardware detection
+      // Hardware detection + auto-scaling
       const hw = detectHardware(adapter);
       setHwInfo(hw);
+      const cores = typeof hw.cores === "number" ? hw.cores : 4;
+      const cfg = getOptimalConfig(cores, hw.memory, hw.gpu?.limits);
+      setOptimalConfig(cfg);
+      setBatchSz(cfg.batchSize);
+
+      // Spawn worker pool
+      try {
+        const pool = createWorkerPool(cfg.workerCount);
+        workerPoolRef.current = pool;
+        setWorkerCount(cfg.workerCount);
+        addLog("ok", `${cfg.workerCount} worker threads spawned`);
+      } catch (e) {
+        addLog("warn", `Workers unavailable: ${e.message}`);
+      }
+
       addLog("info", `${hw.chip} · ${hw.cores} cores · ${hw.memory} RAM · ${hw.browser}`);
+      addLog("info", `Auto-config: batch ${cfg.batchSize.toLocaleString()} · ${cfg.prefetch} prefetch · ${cfg.workerCount} workers`);
       if (hw.npuAvailable) addLog("info", `NPU: ${hw.npuNote}`);
 
       setPhase("idle"); addLog("ok", "Ready");
@@ -1023,6 +1116,68 @@ export default function ProteusVS() {
     })();
   }, []);
 
+  // ─── PREFETCH — fire-and-forget compound loading into buffer ───────
+  const prefetchRef = useRef(0);
+  const fillBuffer = useCallback(async (bid, count) => {
+    const pool = workerPoolRef.current;
+    const buf = compoundBufferRef.current;
+    const maxInFlight = count || optimalConfig?.prefetch || 3;
+    const pageSize = 1000; // ChEMBL max per request
+    const targetTotal = batchSz;
+
+    for (let i = 0; i < maxInFlight && buf.length < maxInFlight; i++) {
+      const fetchId = prefetchRef.current++;
+      // Fire parallel fetches to fill one mega-batch
+      (async () => {
+        const pages = Math.ceil(targetTotal / pageSize);
+        let allMols = [];
+        const fetches = [];
+        for (let p = 0; p < pages; p++) {
+          const offset = (bid + fetchId) * targetTotal + p * pageSize + Math.floor(Math.random() * 500);
+          fetches.push(
+            fetchRawMolecules(offset, Math.min(pageSize, targetTotal - p * pageSize))
+              .catch(() => null)
+          );
+        }
+        const results = await Promise.all(fetches);
+        let src = "ChEMBL";
+        for (const r of results) {
+          if (r?.molecules) allMols.push(...r.molecules);
+        }
+
+        let compounds;
+        if (allMols.length >= 10 && pool) {
+          // Distribute feature extraction across workers
+          const chunkSize = Math.ceil(allMols.length / pool.count);
+          const workerPromises = [];
+          for (let w = 0; w < pool.count; w++) {
+            const chunk = allMols.slice(w * chunkSize, (w + 1) * chunkSize);
+            if (chunk.length > 0) workerPromises.push(pool.dispatch(w, { type: "process_molecules", molecules: chunk }));
+          }
+          const workerResults = await Promise.all(workerPromises);
+          compounds = workerResults.flatMap(r => r.compounds);
+        } else if (allMols.length >= 10) {
+          compounds = allMols.map(processMoleculeMain).filter(Boolean);
+        } else {
+          // Synthetic fallback — generate on workers
+          src = "synthetic";
+          if (pool) {
+            const chunkSize = Math.ceil(targetTotal / pool.count);
+            const workerPromises = [];
+            for (let w = 0; w < pool.count; w++) {
+              workerPromises.push(pool.dispatch(w, { type: "generate_synthetic", startIdx: (bid + fetchId) * targetTotal + w * chunkSize, count: chunkSize }));
+            }
+            const workerResults = await Promise.all(workerPromises);
+            compounds = workerResults.flatMap(r => r.compounds);
+          } else {
+            compounds = generateSyntheticCompounds(bid + fetchId, targetTotal);
+          }
+        }
+        buf.push({ compounds, src });
+      })();
+    }
+  }, [batchSz, optimalConfig]);
+
   // ─── SCORE BATCH ────────────────────────────────────────────────────
   const scoreBatch = useCallback(async (bid) => {
     const cur = targets[targetIdx];
@@ -1030,18 +1185,31 @@ export default function ProteusVS() {
     setPhase("scoring");
     const cycleStart = performance.now();
 
+    // Pull from pre-fetch buffer, or fetch inline
     let compounds, src = "ChEMBL";
-    const offset = bid * batchSz + Math.floor(Math.random() * 200);
-    try {
-      compounds = await fetchRealCompounds(offset, batchSz);
-      if (compounds.length < 10) throw new Error("Too few");
-      addLog("ok", `${compounds.length} compounds from ChEMBL`);
-    } catch (e) {
-      compounds = generateSyntheticCompounds(bid, batchSz);
-      src = "synthetic";
-      addLog("warn", `ChEMBL blocked — synthetic`);
+    const buf = compoundBufferRef.current;
+    if (buf.length > 0) {
+      const entry = buf.shift();
+      compounds = entry.compounds;
+      src = entry.src;
+    } else {
+      // Inline fetch (first batch or buffer empty)
+      const offset = bid * batchSz + Math.floor(Math.random() * 200);
+      try {
+        compounds = await fetchRealCompounds(offset, Math.min(batchSz, 1000));
+        if (compounds.length < 10) throw new Error("Too few");
+        src = "ChEMBL";
+      } catch (e) {
+        compounds = generateSyntheticCompounds(bid, batchSz);
+        src = "synthetic";
+      }
     }
     setDataSource(src);
+    addLog("ok", `${compounds.length} compounds (${src})${buf.length > 0 ? ` · ${buf.length} buffered` : ""}`);
+
+    // Kick off next prefetch while we score
+    fillBuffer(bid + 1);
+
     const fetchEnd = performance.now();
     const fetchMs = fetchEnd - cycleStart;
 
@@ -1049,15 +1217,45 @@ export default function ProteusVS() {
     let scores, usedGpu = false;
     if (gpu && deviceRef.current) {
       try { const gs = await scoreGPU(deviceRef.current, compounds, cur.pharmacophore); scores = Array.from(gs); usedGpu = true; }
-      catch { scores = compounds.map(c => scoreCompound(c, cur.pharmacophore)); }
-    } else { scores = compounds.map(c => scoreCompound(c, cur.pharmacophore)); }
+      catch (e) {
+        // CPU fallback — distribute across workers if available
+        const pool = workerPoolRef.current;
+        if (pool && compounds.length > 100) {
+          const chunkSize = Math.ceil(compounds.length / pool.count);
+          const promises = [];
+          for (let w = 0; w < pool.count; w++) {
+            const chunk = compounds.slice(w * chunkSize, (w + 1) * chunkSize);
+            if (chunk.length > 0) promises.push(pool.dispatch(w, { type: "score_cpu", compounds: chunk, pharmacophore: cur.pharmacophore }));
+          }
+          const results = await Promise.all(promises);
+          scores = results.flatMap(r => r.scores);
+        } else {
+          scores = compounds.map(c => scoreCompound(c, cur.pharmacophore));
+        }
+      }
+    } else {
+      // CPU-only — distribute across workers
+      const pool = workerPoolRef.current;
+      if (pool && compounds.length > 100) {
+        const chunkSize = Math.ceil(compounds.length / pool.count);
+        const promises = [];
+        for (let w = 0; w < pool.count; w++) {
+          const chunk = compounds.slice(w * chunkSize, (w + 1) * chunkSize);
+          if (chunk.length > 0) promises.push(pool.dispatch(w, { type: "score_cpu", compounds: chunk, pharmacophore: cur.pharmacophore }));
+        }
+        const results = await Promise.all(promises);
+        scores = results.flatMap(r => r.scores);
+      } else {
+        scores = compounds.map(c => scoreCompound(c, cur.pharmacophore));
+      }
+    }
     const elapsed = performance.now() - t0;
     setLastMs(elapsed); setCps(Math.round(compounds.length / (elapsed / 1000)));
 
     const totalMs = performance.now() - cycleStart;
     const scoreMs = elapsed;
     const gpuPct = usedGpu ? Math.min(99, Math.round((scoreMs / totalMs) * 100)) : 0;
-    const cpuPct = Math.min(99, Math.round((fetchMs / totalMs) * 100 + (usedGpu ? 5 : (scoreMs / totalMs) * 100)));
+    const cpuPct = Math.min(99, Math.round(((usedGpu ? fetchMs : fetchMs + scoreMs) / totalMs) * 100));
     const idle = Math.max(0, 100 - gpuPct - cpuPct);
     setUtilization({ gpuPct, cpuPct, scoreMs: +scoreMs.toFixed(1), fetchMs: +fetchMs.toFixed(1), totalMs: +totalMs.toFixed(1), idle });
 
@@ -1119,24 +1317,26 @@ export default function ProteusVS() {
     return scored;
   }, [gpu, targets, targetIdx, batchSz, totalScr, topHits]);
 
-  // Auto loop — infinite continuous screening
+  // Auto loop — infinite continuous screening with prefetch pipeline
   useEffect(() => {
     if (!autoMode) return;
     autoRef.current = true; let stop = false; let bid = batchId;
+    // Pre-fill buffer immediately
+    fillBuffer(bid, optimalConfig?.prefetch || 3);
     const loop = async () => {
       while (autoRef.current && !stop) {
         await scoreBatch(bid); bid++;
         if (!autoRef.current || stop) break;
-        // Minimal yield to keep UI responsive, no artificial delay
-        await new Promise(r => setTimeout(r, 50));
+        // Single frame yield — 16ms at 60fps instead of 50ms
+        await new Promise(r => requestAnimationFrame(r));
       }
     }; loop();
-    return () => { stop = true; autoRef.current = false; };
+    return () => { stop = true; autoRef.current = false; compoundBufferRef.current = []; };
   }, [autoMode]);
 
   const toggleAuto = () => {
     if (autoMode) { autoRef.current = false; setAutoMode(false); addLog("sys", "Stopped"); }
-    else { setAutoMode(true); addLog("sys", `Screening ${targets[targetIdx].id} (${targets[targetIdx].disease})`); }
+    else { setAutoMode(true); addLog("sys", `Screening ${targets[targetIdx].id} (${targets[targetIdx].disease}) · batch ${batchSz.toLocaleString()} · ${workerCount} workers`); }
   };
 
   const hitCount = topHits.filter(h => h.score >= HIT_THRESHOLD).length;
@@ -1205,8 +1405,8 @@ export default function ProteusVS() {
 
           {/* Controls */}
           <div style={{ marginTop: 4 }}>
-            <div style={{ fontSize: 8, opacity: 0.5, marginBottom: 2 }}>Batch: {batchSz}</div>
-            <input type="range" min={50} max={500} step={50} value={batchSz} onChange={e => setBatchSz(+e.target.value)} disabled={autoMode} style={{ width: "100%", accentColor: target.color }} />
+            <div style={{ fontSize: 8, opacity: 0.5, marginBottom: 2 }}>Batch: {batchSz.toLocaleString()} · {workerCount} workers</div>
+            <input type="range" min={500} max={50000} step={500} value={batchSz} onChange={e => setBatchSz(+e.target.value)} disabled={autoMode} style={{ width: "100%", accentColor: target.color }} />
           </div>
 
           <button onClick={toggleAuto} disabled={phase === "loading"} style={{
@@ -1680,8 +1880,13 @@ export default function ProteusVS() {
           </div>
 
           {/* Footer */}
-          <div style={{ padding: "6px 10px", borderTop: "1px solid rgba(255,255,255,0.07)", fontSize: 7, opacity: 0.15, lineHeight: 1.6, flexShrink: 0 }}>
-            ✓ PDB · ✓ ChEMBL · ✓ WebGPU · △ 3D approx · △ Unvalidated
+          <div style={{ padding: "6px 10px", borderTop: "1px solid rgba(255,255,255,0.07)", fontSize: 7, opacity: 0.25, lineHeight: 1.6, flexShrink: 0 }}>
+            <div>Browser-native drug screening for neglected tropical diseases.</div>
+            <div style={{ marginTop: 3, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ cursor: "pointer", borderBottom: "1px dotted rgba(255,255,255,0.2)" }} onClick={() => window.open("https://nieltran.com", "_blank")}>nieltran.com</span>
+              <span style={{ cursor: "pointer", borderBottom: "1px dotted rgba(255,255,255,0.2)" }} onClick={() => window.open("https://github.com/d-nieltran", "_blank")}>github/d-nieltran</span>
+            </div>
+            <div style={{ marginTop: 2, opacity: 0.6 }}>&copy; {new Date().getFullYear()} Daniel Tran</div>
           </div>
         </div>
       </div>
