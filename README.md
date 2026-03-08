@@ -105,26 +105,28 @@ PROTEUS detects and reports the client's hardware capabilities:
 
 ## Deploy
 
-PROTEUS is a single React component. Deploy to Cloudflare Pages, Vercel, Netlify, or serve statically.
+PROTEUS is a Vite + React 19 app. Deploy to Cloudflare Pages, Vercel, Netlify, or serve statically.
 
 ### Cloudflare Pages
 
-```bash
-# Clone
-git clone https://github.com/d-nieltran/PROTEUS.git
-cd PROTEUS
+Connect the GitHub repo via the Cloudflare dashboard:
 
-# Connect to Cloudflare Pages via dashboard
-# Framework preset: None (static)
-# Build command: (none)
-# Output directory: /
-```
+- **Framework preset:** None
+- **Build command:** `npm run build`
+- **Build output directory:** `dist`
 
 No Workers, no D1, no server-side compute. The free tier covers everything — unlimited bandwidth and requests.
 
 ### Local
 
-Open `index.html` in a WebGPU-capable browser (Chrome 113+, Edge 113+, or Safari 18+ with feature flag).
+```bash
+git clone https://github.com/d-nieltran/PROTEUS.git
+cd PROTEUS
+npm install
+npm run dev
+```
+
+Open in a WebGPU-capable browser (Chrome 113+, Edge 113+, or Safari 18+ with feature flag).
 
 ---
 
