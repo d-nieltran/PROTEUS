@@ -365,12 +365,34 @@ function getGPUPipeline(device) {
   return _cachedPipeline;
 }
 
+// GPU buffer cache — reuse pharmacophore buffer and pre-allocate compound/score buffers
+let _gpuBufCache = { pB: null, cfgB: null, sB: null, rB: null, lastNC: 0, lastNP: 0 };
+
 async function scoreGPU(device,compounds,pharmacophore){
   const pipe = getGPUPipeline(device);
   const nC=compounds.length,nP=pharmacophore.features.length;
-  const pData=new Float32Array(nP*8);
-  for(let i=0;i<nP;i++){const p=pharmacophore.features[i],o=i*8;
-    new DataView(pData.buffer).setUint32(o*4,FTYPE[p.type]||0,true);pData[o+1]=p.x;pData[o+2]=p.y;pData[o+3]=p.z;pData[o+4]=p.weight;}
+  const mk=(d,u)=>{const b=device.createBuffer({size:Math.max(16,d.byteLength),usage:u});device.queue.writeBuffer(b,0,d instanceof ArrayBuffer?new Uint8Array(d):d);return b;};
+
+  // Reuse pharmacophore buffer if features haven't changed
+  if (!_gpuBufCache.pB || _gpuBufCache.lastNP !== nP) {
+    if (_gpuBufCache.pB) _gpuBufCache.pB.destroy();
+    const pData=new Float32Array(nP*8);
+    for(let i=0;i<nP;i++){const p=pharmacophore.features[i],o=i*8;
+      new DataView(pData.buffer).setUint32(o*4,FTYPE[p.type]||0,true);pData[o+1]=p.x;pData[o+2]=p.y;pData[o+3]=p.z;pData[o+4]=p.weight;}
+    _gpuBufCache.pB=mk(pData,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
+    _gpuBufCache.lastNP=nP;
+  }
+
+  // Reuse score/readback buffers if compound count hasn't changed
+  if (_gpuBufCache.lastNC !== nC) {
+    if (_gpuBufCache.sB) _gpuBufCache.sB.destroy();
+    if (_gpuBufCache.rB) _gpuBufCache.rB.destroy();
+    _gpuBufCache.sB=device.createBuffer({size:nC*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
+    _gpuBufCache.rB=device.createBuffer({size:nC*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
+    _gpuBufCache.lastNC=nC;
+  }
+
+  // Compound data + features — must be rebuilt each batch
   let totF=0;compounds.forEach(c=>totF+=c.features.length);
   const cBuf=new ArrayBuffer(nC*32),cV=new DataView(cBuf);
   const fData=new Float32Array(Math.max(4,totF*4));let fO=0;
@@ -378,20 +400,22 @@ async function scoreGPU(device,compounds,pharmacophore){
     cV.setFloat32(b,c.mw,true);cV.setFloat32(b+4,c.tpsa,true);cV.setFloat32(b+8,c.rotBonds,true);
     cV.setFloat32(b+12,0,true);cV.setUint32(b+16,c.lipinski?1:0,true);cV.setUint32(b+20,c.features.length,true);cV.setUint32(b+24,fO,true);
     for(const f of c.features){const fi=fO*4;new DataView(fData.buffer).setUint32(fi*4,FTYPE[f.type]||0,true);fData[fi+1]=f.x;fData[fi+2]=f.y;fData[fi+3]=f.z;fO++;}}
-  const mk=(d,u)=>{const b=device.createBuffer({size:Math.max(16,d.byteLength),usage:u});device.queue.writeBuffer(b,0,d instanceof ArrayBuffer?new Uint8Array(d):d);return b;};
-  const pB=mk(pData,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST),cB=mk(cBuf,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
+  const cB=mk(cBuf,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
   const fB=mk(fData,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST);
-  const sB=device.createBuffer({size:nC*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
   const cfgB=mk(new Uint32Array([nC,nP,0,0]),GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST);
+
   const bg=device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[
-    {binding:0,resource:{buffer:pB}},{binding:1,resource:{buffer:cB}},{binding:2,resource:{buffer:fB}},
-    {binding:3,resource:{buffer:sB}},{binding:4,resource:{buffer:cfgB}}]});
+    {binding:0,resource:{buffer:_gpuBufCache.pB}},{binding:1,resource:{buffer:cB}},{binding:2,resource:{buffer:fB}},
+    {binding:3,resource:{buffer:_gpuBufCache.sB}},{binding:4,resource:{buffer:cfgB}}]});
   const enc=device.createCommandEncoder();const pass=enc.beginComputePass();
   pass.setPipeline(pipe);pass.setBindGroup(0,bg);pass.dispatchWorkgroups(Math.ceil(nC/64));pass.end();
-  const rB=device.createBuffer({size:nC*4,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST});
-  enc.copyBufferToBuffer(sB,0,rB,0,nC*4);device.queue.submit([enc.finish()]);
-  await rB.mapAsync(GPUMapMode.READ);const res=new Float32Array(rB.getMappedRange().slice(0));rB.unmap();
-  [pB,cB,fB,sB,cfgB,rB].forEach(b=>b.destroy());return res;
+  enc.copyBufferToBuffer(_gpuBufCache.sB,0,_gpuBufCache.rB,0,nC*4);device.queue.submit([enc.finish()]);
+  await _gpuBufCache.rB.mapAsync(GPUMapMode.READ);
+  const res=new Float32Array(_gpuBufCache.rB.getMappedRange().slice(0));
+  _gpuBufCache.rB.unmap();
+  // Only destroy per-batch buffers
+  cB.destroy();fB.destroy();cfgB.destroy();
+  return res;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1246,61 +1270,87 @@ export default function ProteusVS() {
   const fillBuffer = useCallback(async (bid, count) => {
     const pool = workerPoolRef.current;
     const buf = compoundBufferRef.current;
-    const maxInFlight = count || optimalConfig?.prefetch || 3;
+    const maxInFlight = count || optimalConfig?.prefetch || 5;
     const pageSize = 1000; // ChEMBL max per request
     const targetTotal = batchSz;
 
     for (let i = 0; i < maxInFlight && buf.length < maxInFlight; i++) {
       const fetchId = prefetchRef.current++;
-      // Fire parallel fetches to fill one mega-batch
       (async () => {
-        const pages = Math.ceil(targetTotal / pageSize);
-        let allMols = [];
+        // Strategy: fetch ChEMBL in parallel + generate synthetic to fill target batch size
+        // This ensures GPU/CPU always have a full batch, never starved by network
+        const chemblPages = Math.min(3, Math.ceil(targetTotal / pageSize)); // Cap at 3 parallel requests
         const fetches = [];
-        for (let p = 0; p < pages; p++) {
-          const offset = (bid + fetchId) * targetTotal + p * pageSize + Math.floor(Math.random() * 500);
-          fetches.push(
-            fetchRawMolecules(offset, Math.min(pageSize, targetTotal - p * pageSize))
-              .catch(() => null)
-          );
+        for (let p = 0; p < chemblPages; p++) {
+          const offset = (bid + fetchId) * targetTotal + p * pageSize + Math.floor(Math.random() * 2000);
+          fetches.push(fetchRawMolecules(offset, pageSize).catch(() => null));
         }
-        const results = await Promise.all(fetches);
-        let src = "ChEMBL";
+
+        // Simultaneously generate synthetic compounds on workers to fill gap
+        const synthNeeded = Math.max(0, targetTotal - chemblPages * pageSize);
+        let synthPromise = null;
+        if (synthNeeded > 0 && pool) {
+          const chunkSize = Math.ceil(synthNeeded / pool.count);
+          const wp = [];
+          for (let w = 0; w < pool.count; w++) {
+            wp.push(pool.dispatch(w, { type: "generate_synthetic", startIdx: (bid + fetchId) * 100000 + w * chunkSize, count: chunkSize }));
+          }
+          synthPromise = Promise.all(wp);
+        }
+
+        // Wait for both ChEMBL + synthetic in parallel
+        const [chemblResults, synthResults] = await Promise.all([
+          Promise.all(fetches),
+          synthPromise || Promise.resolve(null),
+        ]);
+
+        let allMols = [];
         let anyCached = false;
-        for (const r of results) {
+        for (const r of chemblResults) {
           if (r?.molecules) { allMols.push(...r.molecules); if (r._cached) anyCached = true; }
         }
 
-        let compounds;
+        let compounds = [];
+        let src = "ChEMBL";
+
+        // Process ChEMBL molecules on workers
         if (allMols.length >= 10 && pool) {
-          // Distribute feature extraction across workers
           const chunkSize = Math.ceil(allMols.length / pool.count);
-          const workerPromises = [];
+          const wp = [];
           for (let w = 0; w < pool.count; w++) {
             const chunk = allMols.slice(w * chunkSize, (w + 1) * chunkSize);
-            if (chunk.length > 0) workerPromises.push(pool.dispatch(w, { type: "process_molecules", molecules: chunk }));
+            if (chunk.length > 0) wp.push(pool.dispatch(w, { type: "process_molecules", molecules: chunk }));
           }
-          const workerResults = await Promise.all(workerPromises);
-          compounds = workerResults.flatMap(r => r.compounds);
+          const wr = await Promise.all(wp);
+          compounds = wr.flatMap(r => r.compounds);
           if (anyCached) src = "ChEMBL (cached)";
         } else if (allMols.length >= 10) {
           compounds = allMols.map(processMoleculeMain).filter(Boolean);
           if (anyCached) src = "ChEMBL (cached)";
-        } else {
-          // Last resort synthetic fallback
-          src = "synthetic";
-          if (pool) {
-            const chunkSize = Math.ceil(targetTotal / pool.count);
-            const workerPromises = [];
-            for (let w = 0; w < pool.count; w++) {
-              workerPromises.push(pool.dispatch(w, { type: "generate_synthetic", startIdx: (bid + fetchId) * targetTotal + w * chunkSize, count: chunkSize }));
-            }
-            const workerResults = await Promise.all(workerPromises);
-            compounds = workerResults.flatMap(r => r.compounds);
-          } else {
-            compounds = generateSyntheticCompounds(bid + fetchId, targetTotal);
-          }
         }
+
+        // Pad with synthetic if we didn't reach target total
+        if (compounds.length < targetTotal) {
+          let synth = [];
+          if (synthResults) {
+            synth = synthResults.flatMap(r => r.compounds);
+          } else if (pool) {
+            const need = targetTotal - compounds.length;
+            const chunkSize = Math.ceil(need / pool.count);
+            const wp = [];
+            for (let w = 0; w < pool.count; w++) {
+              wp.push(pool.dispatch(w, { type: "generate_synthetic", startIdx: (bid + fetchId) * 100000 + 50000 + w * chunkSize, count: chunkSize }));
+            }
+            synth = (await Promise.all(wp)).flatMap(r => r.compounds);
+          } else {
+            synth = generateSyntheticCompounds(bid + fetchId, targetTotal - compounds.length);
+          }
+          const chemblCount = compounds.length;
+          compounds = [...compounds, ...synth].slice(0, targetTotal);
+          if (chemblCount > 0) src = `ChEMBL+synth (${chemblCount} real)`;
+          else src = "synthetic";
+        }
+
         buf.push({ compounds, src });
       })();
     }
@@ -1313,7 +1363,7 @@ export default function ProteusVS() {
     setPhase("scoring");
     const cycleStart = performance.now();
 
-    // Pull from pre-fetch buffer, or fetch inline
+    // Pull from pre-fetch buffer, or generate inline to avoid idle GPU
     let compounds, src = "ChEMBL";
     const buf = compoundBufferRef.current;
     if (buf.length > 0) {
@@ -1321,16 +1371,20 @@ export default function ProteusVS() {
       compounds = entry.compounds;
       src = entry.src;
     } else {
-      // Inline fetch (first batch or buffer empty)
-      const offset = bid * batchSz + Math.floor(Math.random() * 200);
-      try {
-        compounds = await fetchRealCompounds(offset, Math.min(batchSz, 1000));
-        if (compounds.length < 10) throw new Error("Too few");
-        src = "ChEMBL";
-      } catch (e) {
+      // Buffer empty — generate synthetic immediately to keep GPU fed
+      // ChEMBL fetch continues in background via fillBuffer
+      const pool = workerPoolRef.current;
+      if (pool) {
+        const chunkSize = Math.ceil(batchSz / pool.count);
+        const wp = [];
+        for (let w = 0; w < pool.count; w++) {
+          wp.push(pool.dispatch(w, { type: "generate_synthetic", startIdx: bid * batchSz + w * chunkSize, count: chunkSize }));
+        }
+        compounds = (await Promise.all(wp)).flatMap(r => r.compounds);
+      } else {
         compounds = generateSyntheticCompounds(bid, batchSz);
-        src = "synthetic";
       }
+      src = "synthetic (buffering)";
     }
     setDataSource(src);
     addLog("ok", `${compounds.length} compounds (${src})${buf.length > 0 ? ` · ${buf.length} buffered` : ""}`);
@@ -1486,17 +1540,24 @@ export default function ProteusVS() {
     return scored;
   }, [gpu, targets, targetIdx, batchSz, totalScr, topHits]);
 
-  // Auto loop — infinite continuous screening with prefetch pipeline
+  // Auto loop — saturating pipeline: score as many micro-batches as possible per frame
   useEffect(() => {
     if (!autoMode) return;
     autoRef.current = true; let stop = false; let bid = batchId;
     // Pre-fill buffer immediately
-    fillBuffer(bid, optimalConfig?.prefetch || 3);
+    fillBuffer(bid, optimalConfig?.prefetch || 5);
+
+    // Score multiple micro-batches, only yield every N batches for UI updates
+    const BATCHES_PER_YIELD = Math.max(1, Math.ceil(batchSz / 1000)); // e.g., batch 20k = yield every 20 micro-batches
     const loop = async () => {
       while (autoRef.current && !stop) {
-        await scoreBatch(bid); bid++;
+        // Tight inner loop: score multiple batches before yielding to UI
+        for (let i = 0; i < BATCHES_PER_YIELD; i++) {
+          if (!autoRef.current || stop) break;
+          await scoreBatch(bid); bid++;
+        }
         if (!autoRef.current || stop) break;
-        // Single frame yield — 16ms at 60fps instead of 50ms
+        // Yield one frame for UI responsiveness
         await new Promise(r => requestAnimationFrame(r));
       }
     }; loop();
