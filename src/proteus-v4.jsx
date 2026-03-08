@@ -689,62 +689,62 @@ function PharmaViewer({ pharmacophore, targetColor, selectedHit, isScreening, la
     const s = sceneRef.current;
 
     if (screenEvent.type === "new_record") {
-      // GOLD SHOCKWAVE + massive flash + camera shake + burst
-      flashRef.current = 1.0;
-      flashColorRef.current = [1, 0.85, 0.2]; // gold
-      shakeRef.current = 1.5;
+      // Subtle gold pulse + light shake
+      flashRef.current = 0.35;
+      flashColorRef.current = [1, 0.85, 0.2];
+      shakeRef.current = 0.4;
       streakRef.current = 0;
-      // Reset shockwave
+      // Gentle shockwave
       s.shockwave.scale.set(0.1, 0.1, 0.1);
-      s.swMat.opacity = 0.6;
+      s.swMat.opacity = 0.2;
       s.swMat.color.set(0xffc832);
       // Event ring
       s.ring3.scale.set(1,1,1);
-      s.ring3Mat.opacity = 0.5;
+      s.ring3Mat.opacity = 0.2;
       s.ring3Mat.color.set(0xffc832);
       // Event light
       s.evtLight.color.set(0xffc832);
-      s.evtLight.intensity = 3;
-      // Burst particles outward
+      s.evtLight.intensity = 1;
+      // Small burst particles
       const bp = s.burstPos, bv = s.burstVel, bc = s.burstCol;
-      for (let i = 0; i < 40; i++) {
+      for (let i = 0; i < 12; i++) {
         bp[i*3]=0; bp[i*3+1]=0; bp[i*3+2]=0;
         const th = Math.random()*Math.PI*2, ph = Math.random()*Math.PI;
-        const sp = 0.3 + Math.random()*0.5;
+        const sp = 0.15 + Math.random()*0.2;
         bv[i*3]=Math.sin(ph)*Math.cos(th)*sp; bv[i*3+1]=Math.cos(ph)*sp; bv[i*3+2]=Math.sin(ph)*Math.sin(th)*sp;
         bc[i*3]=1; bc[i*3+1]=0.85; bc[i*3+2]=0.2;
       }
-      s.burstMat.opacity = 1;
+      s.burstMat.opacity = 0.4;
       s.burst.geometry.attributes.position.needsUpdate = true;
       s.burst.geometry.attributes.color.needsUpdate = true;
-      // Push dust outward
+      // Gentle dust nudge
       const dp = s.dustPos, dv = s.dustVel;
       for (let i = 0; i < 200; i++) {
         const dx=dp[i*3],dy=dp[i*3+1],dz=dp[i*3+2];
         const d=Math.sqrt(dx*dx+dy*dy+dz*dz)+0.1;
-        dv[i*3]+=dx/d*0.15; dv[i*3+1]+=dy/d*0.15; dv[i*3+2]+=dz/d*0.15;
+        dv[i*3]+=dx/d*0.04; dv[i*3+1]+=dy/d*0.04; dv[i*3+2]+=dz/d*0.04;
       }
     }
     else if (screenEvent.type === "multi_hit") {
-      // Multiple hits — bright target-color flash + ring + shake
-      flashRef.current = 0.7;
+      // Multiple hits — moderate flash + ring
+      flashRef.current = 0.3;
       flashColorRef.current = [tCol.r, tCol.g, tCol.b];
-      shakeRef.current = 0.8;
+      shakeRef.current = 0.3;
       streakRef.current = 0;
       s.ring3.scale.set(1,1,1);
-      s.ring3Mat.opacity = 0.35;
+      s.ring3Mat.opacity = 0.15;
       s.ring3Mat.color.copy(tCol);
       s.evtLight.color.copy(tCol);
-      s.evtLight.intensity = 2;
-      // Burst in target color
+      s.evtLight.intensity = 0.8;
+      // Small burst in target color
       const bp = s.burstPos, bv = s.burstVel, bc = s.burstCol;
-      for (let i = 0; i < 40; i++) {
+      for (let i = 0; i < 8; i++) {
         bp[i*3]=0; bp[i*3+1]=0; bp[i*3+2]=0;
-        const th=Math.random()*Math.PI*2, ph=Math.random()*Math.PI, sp=0.2+Math.random()*0.3;
+        const th=Math.random()*Math.PI*2, ph=Math.random()*Math.PI, sp=0.1+Math.random()*0.15;
         bv[i*3]=Math.sin(ph)*Math.cos(th)*sp; bv[i*3+1]=Math.cos(ph)*sp; bv[i*3+2]=Math.sin(ph)*Math.sin(th)*sp;
         bc[i*3]=tCol.r; bc[i*3+1]=tCol.g; bc[i*3+2]=tCol.b;
       }
-      s.burstMat.opacity = 0.8;
+      s.burstMat.opacity = 0.3;
       s.burst.geometry.attributes.position.needsUpdate = true;
       s.burst.geometry.attributes.color.needsUpdate = true;
     }
