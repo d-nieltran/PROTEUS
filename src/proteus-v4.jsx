@@ -1051,8 +1051,9 @@ export default function ProteusVS() {
     const idle = Math.max(0, 100 - gpuPct - cpuPct);
     setUtilization({ gpuPct, cpuPct, scoreMs: +scoreMs.toFixed(1), fetchMs: +fetchMs.toFixed(1), totalMs: +totalMs.toFixed(1), idle });
 
-    const scored = compounds.map((c, i) => ({ ...c, score: +scores[i].toFixed(4), target: cur.id })).sort((a, b) => b.score - a.score);
-    setLastBatch(scored);
+    const withScores = compounds.map((c, i) => ({ ...c, score: +scores[i].toFixed(4), target: cur.id }));
+    const scored = [...withScores].sort((a, b) => b.score - a.score);
+    setLastBatch(withScores);
 
     // Chemical space scatter — keep last 500
     setChemSpace(prev => [...prev, ...scored.map(s => ({ mw: s.mw, logP: s.logP, score: s.score, isHit: s.score >= HIT_THRESHOLD }))].slice(-500));
