@@ -1345,9 +1345,9 @@ export default function ProteusVS() {
   const batchNon = lastBatch.length - batchHits;
 
   return (
-    <div style={{ width: "100vw", height: "100vh", background: "#0c0c18", display: "flex", flexDirection: "column", overflow: "hidden", fontFamily: "'JetBrains Mono','SF Mono',monospace", color: "#d0d0e0" }}>
+    <div className="proteus-root" style={{ width: "100vw", height: "100vh", background: "#0c0c18", display: "flex", flexDirection: "column", overflow: "hidden", fontFamily: "'JetBrains Mono','SF Mono',monospace", color: "#d0d0e0" }}>
       {/* HEADER */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 16px", background: "rgba(14,14,28,0.95)", borderBottom: "1px solid rgba(255,255,255,0.08)", flexShrink: 0, minHeight: 36 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 16px", background: "rgba(14,14,28,0.95)", borderBottom: "1px solid rgba(255,255,255,0.08)", flexShrink: 0, minHeight: 36, flexWrap: "wrap", gap: 4 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 7, height: 7, borderRadius: "50%", background: autoMode ? "#78ff64" : phase === "loading" ? "#ffc832" : "#444", boxShadow: autoMode ? "0 0 8px #78ff64" : "none" }} />
           <span style={{ fontSize: 12, fontWeight: 800, letterSpacing: 3, background: `linear-gradient(135deg,${target.color},#50dcff)`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>PROTEUS</span>
@@ -1363,10 +1363,10 @@ export default function ProteusVS() {
       </div>
 
       {/* MAIN GRID */}
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "200px 1fr 230px", overflow: "hidden", minHeight: 0 }}>
+      <div className="main-grid" style={{ flex: 1, display: "grid", gridTemplateColumns: "200px 1fr 230px", overflow: "hidden", minHeight: 0 }}>
 
         {/* ═══ LEFT PANEL ═══ */}
-        <div style={{ borderRight: "1px solid rgba(255,255,255,0.07)", padding: 10, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, background: "rgba(14,14,28,0.4)", fontSize: 9, minHeight: 0 }}>
+        <div className="panel-left" style={{ borderRight: "1px solid rgba(255,255,255,0.07)", padding: 10, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, background: "rgba(14,14,28,0.4)", fontSize: 9, minHeight: 0 }}>
           <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.45 }}>Targets</div>
           {targets.map((t, i) => {
             const st = pdbStatus[t.pdb];
@@ -1517,10 +1517,10 @@ export default function ProteusVS() {
         </div>
 
         {/* ═══ CENTER ═══ */}
-        <div style={{ display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
+        <div className="panel-center" style={{ display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
 
           {/* TOP ROW: 3D Viewer + Score Dist + Batch Heatmap */}
-          <div style={{ flex: "0 0 45%", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", overflow: "hidden", borderBottom: "1px solid rgba(255,255,255,0.07)" }}>
+          <div className="center-top" style={{ flex: "0 0 45%", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", overflow: "hidden", borderBottom: "1px solid rgba(255,255,255,0.07)" }}>
 
             {/* 3D Pharmacophore */}
             <div style={{ position: "relative", borderRight: "1px solid rgba(255,255,255,0.07)" }}>
@@ -1577,7 +1577,7 @@ export default function ProteusVS() {
           </div>
 
           {/* MIDDLE ROW: Chemical Space + Hit Rate + Throughput */}
-          <div style={{ flex: "0 0 25%", display: "grid", gridTemplateColumns: "1.2fr 0.9fr 0.9fr", overflow: "hidden", borderBottom: "1px solid rgba(255,255,255,0.07)" }}>
+          <div className="center-mid" style={{ flex: "0 0 25%", display: "grid", gridTemplateColumns: "1.2fr 0.9fr 0.9fr", overflow: "hidden", borderBottom: "1px solid rgba(255,255,255,0.07)" }}>
 
             {/* MW vs logP scatter */}
             <div style={{ padding: "8px 10px", display: "flex", flexDirection: "column", borderRight: "1px solid rgba(255,255,255,0.07)" }}>
@@ -1681,7 +1681,7 @@ export default function ProteusVS() {
         </div>
 
         {/* ═══ RIGHT PANEL ═══ */}
-        <div style={{ borderLeft: "1px solid rgba(255,255,255,0.07)", display: "flex", flexDirection: "column", background: "rgba(14,14,28,0.4)", overflow: "hidden", minHeight: 0 }}>
+        <div className="panel-right" style={{ borderLeft: "1px solid rgba(255,255,255,0.07)", display: "flex", flexDirection: "column", background: "rgba(14,14,28,0.4)", overflow: "hidden", minHeight: 0 }}>
 
           {/* Hardware Info */}
           <div style={{ padding: "8px 10px", borderBottom: "1px solid rgba(255,255,255,0.07)", flexShrink: 0 }}>
@@ -1894,7 +1894,24 @@ export default function ProteusVS() {
       <style>{`*{box-sizing:border-box;margin:0;padding:0;}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
         ::-webkit-scrollbar{width:3px;}::-webkit-scrollbar-track{background:transparent;}
-        ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.10);border-radius:2px;}`}</style>
+        ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.10);border-radius:2px;}
+
+        @media(max-width:900px){
+          .proteus-root{overflow-y:auto !important;height:auto !important;min-height:100vh !important;}
+          .main-grid{grid-template-columns:1fr !important;grid-template-rows:auto 1fr auto !important;overflow-y:auto !important;}
+          .panel-left{border-right:none !important;border-bottom:1px solid rgba(255,255,255,0.07);max-height:none !important;overflow:visible !important;}
+          .panel-center{min-height:auto !important;}
+          .center-top{grid-template-columns:1fr !important;flex:none !important;height:auto !important;}
+          .center-top>div{min-height:200px;}
+          .center-mid{grid-template-columns:1fr !important;flex:none !important;height:auto !important;}
+          .center-mid>div{min-height:160px;}
+          .panel-right{border-left:none !important;border-top:1px solid rgba(255,255,255,0.07);overflow:visible !important;max-height:none !important;}
+        }
+
+        @media(max-width:600px){
+          .center-top>div{min-height:180px;}
+          .center-mid>div{min-height:140px;}
+        }`}</style>
     </div>
   );
 }
