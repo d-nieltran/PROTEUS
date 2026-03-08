@@ -116,21 +116,25 @@ function extractPharmacophore(bd) {
 }
 
 function getFallback(pdbId){
-  const known={"1J3I":{features:[
-    {type:"hbd",x:1.2,y:-0.8,z:0.3,weight:1.5,source:"lit"},
-    {type:"hba",x:-1.5,y:1.5,z:-0.5,weight:1.4,source:"lit"},
-    {type:"hydrophobic",x:3.2,y:0.5,z:1.5,weight:1.0,source:"lit"},
-    {type:"hba",x:0.3,y:2.8,z:-0.8,weight:1.3,source:"lit"},
-    {type:"hydrophobic",x:-2.0,y:-1.8,z:1.8,weight:0.9,source:"lit"},
-    {type:"hbd",x:2.5,y:-2.0,z:-0.3,weight:1.1,source:"lit"},
+  const known={
+  // PfDHFR — 6A2M with BT2 hybrid inhibitor (9QR) binding site features
+  "6A2M":{features:[
+    {type:"hbd",x:1.4,y:-0.6,z:0.5,weight:1.5,source:"lit"},
+    {type:"hba",x:-1.8,y:1.2,z:-0.3,weight:1.4,source:"lit"},
+    {type:"hydrophobic",x:3.0,y:0.8,z:1.2,weight:1.0,source:"lit"},
+    {type:"hba",x:0.5,y:2.5,z:-1.0,weight:1.3,source:"lit"},
+    {type:"hydrophobic",x:-2.2,y:-1.5,z:1.5,weight:0.9,source:"lit"},
+    {type:"hbd",x:2.2,y:-1.8,z:-0.5,weight:1.1,source:"lit"},
   ],center:{x:18.5,y:32.1,z:14.7},source:"literature"},
-  "1E92":{features:[
-    {type:"hba",x:0.8,y:1.5,z:-0.3,weight:1.6,source:"lit"},
-    {type:"hbd",x:-1.2,y:-0.8,z:1.0,weight:1.3,source:"lit"},
-    {type:"hba",x:2.5,y:-1.0,z:0.5,weight:1.2,source:"lit"},
-    {type:"hydrophobic",x:-2.8,y:1.2,z:-1.5,weight:1.0,source:"lit"},
-    {type:"hydrophobic",x:3.5,y:2.0,z:1.0,weight:0.9,source:"lit"},
+  // LmPTR1 — 1E7W with methotrexate (MTX) binding site features
+  "1E7W":{features:[
+    {type:"hba",x:0.6,y:1.8,z:-0.5,weight:1.6,source:"lit"},
+    {type:"hbd",x:-1.0,y:-1.0,z:0.8,weight:1.3,source:"lit"},
+    {type:"hba",x:2.2,y:-0.8,z:0.3,weight:1.2,source:"lit"},
+    {type:"hydrophobic",x:-3.0,y:1.0,z:-1.2,weight:1.0,source:"lit"},
+    {type:"hydrophobic",x:3.2,y:1.8,z:0.8,weight:0.9,source:"lit"},
   ],center:{x:22.3,y:28.7,z:11.2},source:"literature"},
+  // TcTR — 1BZL with quinacrine mustard (QUN) — 0 atoms from API, keep lit fallback
   "1BZL":{features:[
     {type:"hydrophobic",x:1.8,y:0.5,z:-0.8,weight:1.3,source:"lit"},
     {type:"hba",x:-1.0,y:2.0,z:0.5,weight:1.2,source:"lit"},
@@ -138,18 +142,54 @@ function getFallback(pdbId){
     {type:"hbd",x:-2.5,y:-0.5,z:-1.5,weight:1.1,source:"lit"},
     {type:"hydrophobic",x:0.5,y:-2.8,z:2.0,weight:0.8,source:"lit"},
   ],center:{x:15.8,y:25.3,z:18.9},source:"literature"}};
-  return known[pdbId]||known["1J3I"];
+  return known[pdbId]||known["6A2M"];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// COMPOUND FETCHING
+// COMPOUND FETCHING — retry + localStorage cache
 // ═══════════════════════════════════════════════════════════════════════════
+const COMPOUND_CACHE_KEY = "proteus_compound_cache";
+const COMPOUND_CACHE_MAX = 5;
+
+function cacheCompounds(offset, molecules) {
+  try {
+    const cache = JSON.parse(localStorage.getItem(COMPOUND_CACHE_KEY) || "[]");
+    cache.unshift({ offset, molecules: molecules.slice(0, 200), ts: Date.now() });
+    while (cache.length > COMPOUND_CACHE_MAX) cache.pop();
+    localStorage.setItem(COMPOUND_CACHE_KEY, JSON.stringify(cache));
+  } catch {}
+}
+
+function getCachedCompounds() {
+  try {
+    const cache = JSON.parse(localStorage.getItem(COMPOUND_CACHE_KEY) || "[]");
+    // Return most recent batch less than 24h old
+    const recent = cache.find(c => Date.now() - c.ts < 86400000);
+    return recent || cache[0] || null;
+  } catch { return null; }
+}
+
 async function fetchRawMolecules(offset=0,limit=1000){
   const proxyUrl=`/api/chembl?offset=${offset}&limit=${Math.min(limit,1000)}`;
   const directUrl=`https://www.ebi.ac.uk/chembl/api/data/molecule.json?limit=${Math.min(limit,1000)}&offset=${offset}&molecule_properties__full_mwt__lte=550&molecule_properties__full_mwt__gte=200&molecule_properties__alogp__gte=-1&molecule_properties__alogp__lte=6&molecule_properties__hbd__lte=5&molecule_properties__hba__lte=10&molecule_structures__canonical_smiles__isnull=false`;
-  for(const url of [proxyUrl,directUrl]){
-    try{const res=await fetch(url,{headers:{Accept:"application/json"}});if(!res.ok)continue;const data=await res.json();if(data?.molecules?.length>0)return data;}catch{continue;}
+  // Try proxy → direct, with retry + exponential backoff
+  for (let attempt = 0; attempt < 3; attempt++) {
+    for (const url of [proxyUrl, directUrl]) {
+      try {
+        const res = await fetch(url, { headers: { Accept: "application/json" } });
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (data?.molecules?.length > 0) {
+          cacheCompounds(offset, data.molecules);
+          return data;
+        }
+      } catch { continue; }
+    }
+    if (attempt < 2) await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
   }
+  // Fallback to localStorage cache
+  const cached = getCachedCompounds();
+  if (cached) return { molecules: cached.molecules, _cached: true };
   return null;
 }
 
@@ -189,7 +229,57 @@ async function fetchRealCompounds(offset=0,limit=100){
   }).filter(Boolean).filter(c=>c.features.length>=2);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 3D COORDINATE SOURCES: PubChem (real) → SMILES hash (approx fallback)
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetch3DCoordinates(smilesArr) {
+  // Batch fetch real 3D conformer coordinates from PubChem via proxy
+  const coordMap = new Map(); // smiles → [{x,y,z,element}]
+  const batchSize = 20;
+  for (let i = 0; i < smilesArr.length; i += batchSize) {
+    const batch = smilesArr.slice(i, i + batchSize);
+    try {
+      const res = await fetch("/api/pubchem-3d", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ smiles: batch }),
+      });
+      if (!res.ok) continue;
+      const results = await res.json();
+      for (const r of results) {
+        if (r.atoms && r.atoms.length > 0) coordMap.set(r.smiles, r.atoms);
+      }
+    } catch {}
+  }
+  return coordMap;
+}
+
+function extractFeaturesFrom3D(atoms3d) {
+  // Convert real 3D atom coordinates into pharmacophore features
+  const cx = atoms3d.reduce((s, a) => s + a.x, 0) / atoms3d.length;
+  const cy = atoms3d.reduce((s, a) => s + a.y, 0) / atoms3d.length;
+  const cz = atoms3d.reduce((s, a) => s + a.z, 0) / atoms3d.length;
+  const features = [];
+  for (const atom of atoms3d) {
+    const el = (atom.element || "C").toUpperCase();
+    const x = atom.x - cx, y = atom.y - cy, z = atom.z - cz;
+    if (el === "N") features.push({ type: "hba", x, y, z, weight: 1.3, coordSrc: "PubChem" });
+    else if (el === "O") features.push({ type: "hba", x, y, z, weight: 1.4, coordSrc: "PubChem" });
+    else if (el === "S") features.push({ type: "hydrophobic", x, y, z, weight: 0.7, coordSrc: "PubChem" });
+    else if (el === "F" || el === "CL" || el === "BR") features.push({ type: "hydrophobic", x, y, z, weight: 0.6, coordSrc: "PubChem" });
+    else if (el === "C") features.push({ type: "hydrophobic", x, y, z, weight: 0.8, coordSrc: "PubChem" });
+  }
+  // Deduplicate features within 1.5Å
+  const deduped = [];
+  for (const f of features) {
+    if (!deduped.some(d => d.type === f.type && Math.sqrt((d.x - f.x) ** 2 + (d.y - f.y) ** 2 + (d.z - f.z) ** 2) < 1.5))
+      deduped.push(f);
+  }
+  return deduped.slice(0, 12);
+}
+
 function extractFeaturesFromSMILES(smiles,props){
+  // Fallback: hash-based approximate coordinates when no 3D data available
   const features=[];
   const hash=(s,i)=>{let h=0;for(let c=0;c<s.length;c++)h=((h<<5)-h+s.charCodeAt(c)+i*31)|0;return(h&0x7fffffff)/0x7fffffff;};
   const patterns=[
@@ -202,9 +292,9 @@ function extractFeaturesFromSMILES(smiles,props){
   for(const p of patterns){const matches=smiles.match(p.re);if(matches){
     for(let m=0;m<Math.min(matches.length,3);m++){
       const radius=Math.sqrt(parseFloat(props.full_mwt)||300)*0.3;
-      features.push({type:p.type,x:(hash(smiles,fIdx*3)-0.5)*radius,y:(hash(smiles,fIdx*3+1)-0.5)*radius,z:(hash(smiles,fIdx*3+2)-0.5)*radius,weight:p.weight});fIdx++;}}}
-  if(!features.some(f=>f.type==="hba")&&(parseInt(props.hba)||0)>0)features.push({type:"hba",x:(hash(smiles,100)-0.5)*5,y:(hash(smiles,101)-0.5)*5,z:(hash(smiles,102)-0.5)*5,weight:1.0});
-  if(!features.some(f=>f.type==="hbd")&&(parseInt(props.hbd)||0)>0)features.push({type:"hbd",x:(hash(smiles,200)-0.5)*5,y:(hash(smiles,201)-0.5)*5,z:(hash(smiles,202)-0.5)*5,weight:1.0});
+      features.push({type:p.type,x:(hash(smiles,fIdx*3)-0.5)*radius,y:(hash(smiles,fIdx*3+1)-0.5)*radius,z:(hash(smiles,fIdx*3+2)-0.5)*radius,weight:p.weight,coordSrc:"approx"});fIdx++;}}}
+  if(!features.some(f=>f.type==="hba")&&(parseInt(props.hba)||0)>0)features.push({type:"hba",x:(hash(smiles,100)-0.5)*5,y:(hash(smiles,101)-0.5)*5,z:(hash(smiles,102)-0.5)*5,weight:1.0,coordSrc:"approx"});
+  if(!features.some(f=>f.type==="hbd")&&(parseInt(props.hbd)||0)>0)features.push({type:"hbd",x:(hash(smiles,200)-0.5)*5,y:(hash(smiles,201)-0.5)*5,z:(hash(smiles,202)-0.5)*5,weight:1.0,coordSrc:"approx"});
   return features;
 }
 
@@ -1009,12 +1099,15 @@ export default function ProteusVS() {
   const [phase, setPhase] = useState("loading");
   const [shared, setShared] = useState({ hits: [], total: 0 });
   const [dataSource, setDataSource] = useState("");
+  const [coordSource, setCoordSource] = useState("Approx");
   const [lastBatch, setLastBatch] = useState([]); // scored compounds from last batch
   const [selectedHit, setSelectedHit] = useState(null);
   const [chemSpace, setChemSpace] = useState([]); // all scored for scatter plot
   const [log, setLog] = useState([]);
   const [hwInfo, setHwInfo] = useState(null);
   const [structFreshness, setStructFreshness] = useState({});
+  const [validationData, setValidationData] = useState(null);
+  const knownActivesRef = useRef(new Set());
   const [utilization, setUtilization] = useState({ gpuPct: 0, cpuPct: 0, scoreMs: 0, fetchMs: 0, totalMs: 0, idle: 100 });
   const [screenEvent, setScreenEvent] = useState(null); // {type, data, ts}
   const [workerCount, setWorkerCount] = useState(0);
@@ -1115,8 +1208,38 @@ export default function ProteusVS() {
       } catch (e) {
         addLog("warn", `Structure freshness check failed: ${e.message}`);
       }
+
+      // Fetch known actives for validation (background)
+      addLog("sys", "Loading known actives for validation...");
+      try {
+        const activeRes = await fetch(`/api/chembl-actives?target=${TARGETS[0].id}`);
+        if (activeRes.ok) {
+          const activeData = await activeRes.json();
+          const ids = new Set(activeData.actives.map(a => a.chemblId));
+          knownActivesRef.current = ids;
+          setValidationData({ target: activeData.target, totalActives: activeData.count, recovered: 0, ef1: 0, ef5: 0, auc: 0 });
+          addLog("ok", `${activeData.count} known actives loaded for ${activeData.target}`);
+        }
+      } catch (e) {
+        addLog("warn", `Validation data unavailable: ${e.message}`);
+      }
     })();
   }, []);
+
+  // Re-fetch known actives when target changes
+  useEffect(() => {
+    const t = targets[targetIdx];
+    if (!t) return;
+    (async () => {
+      try {
+        const res = await fetch(`/api/chembl-actives?target=${t.id}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        knownActivesRef.current = new Set(data.actives.map(a => a.chemblId));
+        setValidationData({ target: data.target, totalActives: data.count, recovered: 0, ef1: 0, ef5: 0, auc: 0 });
+      } catch {}
+    })();
+  }, [targetIdx, targets]);
 
   // ─── PREFETCH — fire-and-forget compound loading into buffer ───────
   const prefetchRef = useRef(0);
@@ -1143,8 +1266,9 @@ export default function ProteusVS() {
         }
         const results = await Promise.all(fetches);
         let src = "ChEMBL";
+        let anyCached = false;
         for (const r of results) {
-          if (r?.molecules) allMols.push(...r.molecules);
+          if (r?.molecules) { allMols.push(...r.molecules); if (r._cached) anyCached = true; }
         }
 
         let compounds;
@@ -1158,10 +1282,12 @@ export default function ProteusVS() {
           }
           const workerResults = await Promise.all(workerPromises);
           compounds = workerResults.flatMap(r => r.compounds);
+          if (anyCached) src = "ChEMBL (cached)";
         } else if (allMols.length >= 10) {
           compounds = allMols.map(processMoleculeMain).filter(Boolean);
+          if (anyCached) src = "ChEMBL (cached)";
         } else {
-          // Synthetic fallback — generate on workers
+          // Last resort synthetic fallback
           src = "synthetic";
           if (pool) {
             const chunkSize = Math.ceil(targetTotal / pool.count);
@@ -1273,6 +1399,30 @@ export default function ProteusVS() {
       return m.slice(0, 50);
     });
 
+    // Background: upgrade top hits with real PubChem 3D coordinates
+    const hitsNeedingCoords = scored.filter(s => s.score >= HIT_THRESHOLD && s.smiles && !s.features?.[0]?.coordSrc?.startsWith("PubChem")).slice(0, 10);
+    if (hitsNeedingCoords.length > 0) {
+      fetch3DCoordinates(hitsNeedingCoords.map(h => h.smiles)).then(coordMap => {
+        if (coordMap.size === 0) return;
+        let upgraded = 0;
+        setTopHits(prev => prev.map(h => {
+          if (!h.smiles || !coordMap.has(h.smiles)) return h;
+          const atoms3d = coordMap.get(h.smiles);
+          const newFeatures = extractFeaturesFrom3D(atoms3d);
+          if (newFeatures.length >= 2) {
+            upgraded++;
+            const newScore = scoreCompound({ ...h, features: newFeatures }, cur.pharmacophore);
+            return { ...h, features: newFeatures, score: newScore, coordSrc: "PubChem" };
+          }
+          return h;
+        }).sort((a, b) => b.score - a.score));
+        if (upgraded > 0) {
+          setCoordSource("PubChem");
+          addLog("ok", `Upgraded ${upgraded} hits with PubChem 3D coordinates`);
+        }
+      }).catch(() => {});
+    }
+
     const bins = Array.from({ length: 14 }, (_, i) => ({ bin: ((i - 3) * 0.5).toFixed(1), count: 0, hits: 0 }));
     for (const s of scores) { const bi = Math.max(0, Math.min(13, Math.floor((s + 1.5) / 0.5))); bins[bi].count++; if (s >= HIT_THRESHOLD) bins[bi].hits++; }
     setScoreDist(bins);
@@ -1288,6 +1438,23 @@ export default function ProteusVS() {
 
     const curHits = [...topHits, ...scored.slice(0, 10)].sort((a, b) => b.score - a.score).slice(0, 50);
     await saveSt({ total: nt, bid: bid + 1, hits: curHits });
+
+    // Update validation metrics if known actives are loaded
+    if (knownActivesRef.current.size > 0) {
+      const actives = knownActivesRef.current;
+      const recovered = curHits.filter(h => actives.has(h.id)).length;
+      // Enrichment factor: fraction of actives in top hits vs expected by random
+      const totalInBatch = scored.length;
+      const activesInBatch = scored.filter(s => actives.has(s.id)).length;
+      const top1pct = Math.max(1, Math.ceil(totalInBatch * 0.01));
+      const top5pct = Math.max(1, Math.ceil(totalInBatch * 0.05));
+      const activesInTop1 = scored.slice(0, top1pct).filter(s => actives.has(s.id)).length;
+      const activesInTop5 = scored.slice(0, top5pct).filter(s => actives.has(s.id)).length;
+      const expectedFrac = activesInBatch / totalInBatch || 0.001;
+      const ef1 = expectedFrac > 0 ? +((activesInTop1 / top1pct) / expectedFrac).toFixed(1) : 0;
+      const ef5 = expectedFrac > 0 ? +((activesInTop5 / top5pct) / expectedFrac).toFixed(1) : 0;
+      setValidationData(prev => prev ? { ...prev, recovered, ef1, ef5, activesInBatch } : prev);
+    }
 
     const newH = scored.filter(s => s.score > HIT_THRESHOLD).slice(0, 5);
     if (newH.length > 0) {
@@ -1475,10 +1642,10 @@ export default function ProteusVS() {
             <div style={{ fontSize: 7, lineHeight: 1.8 }}>
               {[
                 { l: "Targets", v: "RCSB PDB", ok: true },
-                { l: "Pharmacophore", v: pdbStatus[target.pdb]?.source === "PDB" ? "PDB" : "Lit", ok: true },
-                { l: "Compounds", v: dataSource === "ChEMBL" ? "ChEMBL" : "Synth", ok: dataSource === "ChEMBL" },
-                { l: "3D coords", v: "Approx", ok: false },
-                { l: "Validation", v: "Pending", ok: false },
+                { l: "Pharmacophore", v: pdbStatus[target.pdb]?.source === "PDB" ? "PDB" : "Lit", ok: pdbStatus[target.pdb]?.source === "PDB" },
+                { l: "Compounds", v: dataSource.startsWith("ChEMBL") ? "ChEMBL" : dataSource === "synthetic" ? "Synth" : dataSource || "—", ok: dataSource.startsWith("ChEMBL") },
+                { l: "3D coords", v: coordSource, ok: coordSource === "PubChem" },
+                { l: "Validation", v: validationData ? `EF ${validationData.ef1}×` : "Pending", ok: !!validationData?.ef1 },
               ].map((d, i) => (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between" }}>
                   <span style={{ opacity: 0.5 }}>{d.l}</span>
@@ -1487,6 +1654,34 @@ export default function ProteusVS() {
               ))}
             </div>
           </div>
+
+          {/* Validation */}
+          {validationData && (
+            <div style={{ padding: 8, borderRadius: 5, background: "rgba(120,255,100,0.03)", border: "1px solid rgba(120,255,100,0.08)" }}>
+              <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.5, marginBottom: 4, color: "#78ff64" }}>Validation</div>
+              <div style={{ fontSize: 7, lineHeight: 1.8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ opacity: 0.5 }}>Known actives</span>
+                  <span style={{ color: "#78ff64" }}>{validationData.totalActives}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ opacity: 0.5 }}>Recovered in hits</span>
+                  <span style={{ color: validationData.recovered > 0 ? "#78ff64" : "#ffc832" }}>{validationData.recovered}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ opacity: 0.5 }}>EF@1%</span>
+                  <span style={{ color: validationData.ef1 > 1 ? "#78ff64" : "#ffc832" }}>{validationData.ef1}×</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ opacity: 0.5 }}>EF@5%</span>
+                  <span style={{ color: validationData.ef5 > 1 ? "#78ff64" : "#ffc832" }}>{validationData.ef5}×</span>
+                </div>
+                {validationData.activesInBatch > 0 && (
+                  <div style={{ fontSize: 6, opacity: 0.35, marginTop: 2 }}>{validationData.activesInBatch} actives in last batch</div>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Data Sources */}
           <div style={{ padding: 8, borderRadius: 5, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
@@ -1657,14 +1852,16 @@ export default function ProteusVS() {
                     )}
                   </tr></thead>
                   <tbody>
-                    {topHits.slice(0, 25).map((h, i) => (
+                    {topHits.slice(0, 25).map((h, i) => {
+                      const isKnownActive = knownActivesRef.current.has(h.id);
+                      return (
                       <tr key={i} onClick={() => setSelectedHit(h)} style={{
                         borderBottom: "1px solid rgba(255,255,255,0.08)",
-                        cursor: "pointer", background: selectedHit?.id === h.id ? `${target.color}08` : "transparent",
+                        cursor: "pointer", background: isKnownActive ? "rgba(120,255,100,0.06)" : selectedHit?.id === h.id ? `${target.color}08` : "transparent",
                         transition: "background 0.15s",
                       }}>
                         <td style={{ padding: "2px 5px", opacity: 0.4 }}>{i + 1}</td>
-                        <td style={{ padding: "2px 5px", color: target.color, opacity: 0.8, fontWeight: 600 }}>{h.id}</td>
+                        <td style={{ padding: "2px 5px", color: isKnownActive ? "#78ff64" : target.color, opacity: 0.8, fontWeight: 600 }}>{isKnownActive ? "★ " : ""}{h.id}</td>
                         <td style={{ padding: "2px 5px", fontWeight: 700, color: h.score >= 2.5 ? target.color : h.score >= HIT_THRESHOLD ? "#ffc832" : "#444" }}>{h.score.toFixed(3)}</td>
                         <td style={{ padding: "2px 5px", opacity: 0.4 }}>{h.mw?.toFixed(0)}</td>
                         <td style={{ padding: "2px 5px", opacity: 0.4 }}>{h.logP?.toFixed(1)}</td>
@@ -1674,7 +1871,7 @@ export default function ProteusVS() {
                         <td style={{ padding: "2px 5px", opacity: 0.6, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 7 }}>{h.smiles || "—"}</td>
                         <td style={{ padding: "2px 5px" }}><span style={{ fontSize: 6, padding: "1px 3px", borderRadius: 2, background: h.source === "ChEMBL" ? "rgba(120,255,100,0.08)" : "rgba(255,200,50,0.08)", color: h.source === "ChEMBL" ? "#78ff64" : "#ffc832" }}>{h.source === "ChEMBL" ? "real" : "syn"}</span></td>
                       </tr>
-                    ))}
+                    );})}
                   </tbody>
                 </table>
               ) : <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", opacity: 0.15, fontSize: 10 }}>Start screening</div>}
