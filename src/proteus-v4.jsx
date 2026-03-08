@@ -35,11 +35,17 @@ const DATA_SOURCES = [
 // PDB + PHARMACOPHORE
 // ═══════════════════════════════════════════════════════════════════════════
 async function fetchPDBBindingSite(pdbId, ligandId) {
-  const coordUrl = `https://models.rcsb.org/v1/${pdbId}/atoms?label_comp_id=${ligandId}&encoding=json`;
-  try {
-    const r = await fetch(coordUrl);
-    if (r.ok) return { ligandAtoms: await r.json(), pdbId, ligandId };
-  } catch(e) {}
+  const proxyUrl = `/api/pdb-atoms?pdbId=${pdbId}&ligandId=${ligandId}`;
+  const directUrl = `https://models.rcsb.org/v1/${pdbId}/atoms?label_comp_id=${ligandId}&encoding=json`;
+  for (const url of [proxyUrl, directUrl]) {
+    try {
+      const r = await fetch(url, { headers: { Accept: "application/json" } });
+      if (!r.ok) continue;
+      const data = await r.json();
+      const atoms = Array.isArray(data) ? data : data?.atoms || data?.atom_site || [];
+      if (atoms.length > 0) return { ligandAtoms: atoms, pdbId, ligandId };
+    } catch(e) {}
+  }
   return { ligandAtoms: null, pdbId, ligandId };
 }
 
@@ -96,9 +102,13 @@ function getFallback(pdbId){
 // COMPOUND FETCHING
 // ═══════════════════════════════════════════════════════════════════════════
 async function fetchRealCompounds(offset=0,limit=100){
-  const url=`https://www.ebi.ac.uk/chembl/api/data/molecule.json?limit=${limit}&offset=${offset}&molecule_properties__full_mwt__lte=550&molecule_properties__full_mwt__gte=200&molecule_properties__alogp__gte=-1&molecule_properties__alogp__lte=6&molecule_properties__hbd__lte=5&molecule_properties__hba__lte=10&molecule_structures__canonical_smiles__isnull=false`;
-  const res=await fetch(url);if(!res.ok)throw new Error(`${res.status}`);
-  const data=await res.json();
+  const proxyUrl=`/api/chembl?offset=${offset}&limit=${limit}`;
+  const directUrl=`https://www.ebi.ac.uk/chembl/api/data/molecule.json?limit=${limit}&offset=${offset}&molecule_properties__full_mwt__lte=550&molecule_properties__full_mwt__gte=200&molecule_properties__alogp__gte=-1&molecule_properties__alogp__lte=6&molecule_properties__hbd__lte=5&molecule_properties__hba__lte=10&molecule_structures__canonical_smiles__isnull=false`;
+  let data=null;
+  for(const url of [proxyUrl,directUrl]){
+    try{const res=await fetch(url,{headers:{Accept:"application/json"}});if(!res.ok)continue;data=await res.json();if(data?.molecules?.length>0)break;data=null;}catch{continue;}
+  }
+  if(!data||!data.molecules)throw new Error("All sources failed");
   return data.molecules.map(m=>{
     const p=m.molecule_properties;if(!p)return null;
     const smiles=m.molecule_structures?.canonical_smiles;if(!smiles)return null;
@@ -243,14 +253,14 @@ async function checkForBetterStructures(targets) {
         return_type: "entry",
         request_options: { results_verbosity: "verbose", return_all_hits: false, paginate: { start: 0, rows: 10 }, sort: [{ sort_by: "rcsb_entry_info.resolution_combined", direction: "asc" }] },
       };
-      const res = await fetch("https://search.rcsb.org/rcsbsearch/v2/query", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(searchPayload),
-      });
+      let res;
+      try { res = await fetch("/api/pdb-search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(searchPayload) }); } catch {}
+      if (!res?.ok) { try { res = await fetch("https://search.rcsb.org/rcsbsearch/v2/query", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(searchPayload) }); } catch {} }
 
-      if (!res.ok) {
+      if (!res?.ok) {
         // Fallback: simple entry lookup to check last modified date
-        const entryRes = await fetch(`https://data.rcsb.org/rest/v1/core/entry/${t.pdb}`);
-        if (entryRes.ok) {
+        let entryRes; try { entryRes = await fetch(`/api/pdb-entry?pdbId=${t.pdb}`); } catch {} if (!entryRes?.ok) { try { entryRes = await fetch(`https://data.rcsb.org/rest/v1/core/entry/${t.pdb}`); } catch {} }
+        if (entryRes?.ok) {
           const entry = await entryRes.json();
           const deposited = entry.rcsb_accession_info?.deposit_date;
           const revised = entry.rcsb_accession_info?.revision_date;
@@ -275,9 +285,9 @@ async function checkForBetterStructures(targets) {
       });
 
       // Also fetch current entry info
-      const entryRes = await fetch(`https://data.rcsb.org/rest/v1/core/entry/${t.pdb}`);
+      let entryRes; try { entryRes = await fetch(`/api/pdb-entry?pdbId=${t.pdb}`); } catch {} if (!entryRes?.ok) { try { entryRes = await fetch(`https://data.rcsb.org/rest/v1/core/entry/${t.pdb}`); } catch {} }
       let currentRes = t.resolution, deposited = "unknown", lastRevised = "unknown";
-      if (entryRes.ok) {
+      if (entryRes?.ok) {
         const entry = await entryRes.json();
         deposited = entry.rcsb_accession_info?.deposit_date?.split("T")[0] || "unknown";
         lastRevised = entry.rcsb_accession_info?.revision_date?.split("T")[0] || "unknown";
@@ -1256,6 +1266,54 @@ export default function ProteusVS() {
             <div style={{ fontSize: 16, fontWeight: 700, color: "#50dcff" }}>{shared.total.toLocaleString()}</div>
             <div style={{ fontSize: 8, opacity: 0.3 }}>{shared.hits.length} shared hits</div>
           </div>
+
+          {/* Provenance */}
+          <div style={{ padding: 8, borderRadius: 5, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+            <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.5, marginBottom: 4 }}>Provenance</div>
+            <div style={{ fontSize: 7, lineHeight: 1.8 }}>
+              {[
+                { l: "Targets", v: "RCSB PDB", ok: true },
+                { l: "Pharmacophore", v: pdbStatus[target.pdb]?.source === "PDB" ? "PDB" : "Lit", ok: true },
+                { l: "Compounds", v: dataSource === "ChEMBL" ? "ChEMBL" : "Synth", ok: dataSource === "ChEMBL" },
+                { l: "3D coords", v: "Approx", ok: false },
+                { l: "Validation", v: "Pending", ok: false },
+              ].map((d, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ opacity: 0.5 }}>{d.l}</span>
+                  <span style={{ color: d.ok ? "#78ff64" : "#ffc832" }}>{d.ok ? "✓" : "△"} {d.v}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Data Sources */}
+          <div style={{ padding: 8, borderRadius: 5, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)" }}>
+            <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.5, marginBottom: 4 }}>Data Sources</div>
+            <div style={{ fontSize: 7, lineHeight: 1.6 }}>
+              {DATA_SOURCES.map((s, i) => (
+                <div key={i} style={{ marginBottom: 3 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ cursor: "pointer", color: "#50dcff", borderBottom: "1px dotted rgba(80,220,255,0.3)" }} onClick={() => window.open(s.url, "_blank")}>{s.name} ↗</span>
+                    <span style={{ fontSize: 6, opacity: 0.35 }}>{s.used}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Reference */}
+          <div style={{ padding: 8, borderRadius: 5, background: `${target.color}04`, border: `1px solid ${target.color}10` }}>
+            <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.5, color: target.color, marginBottom: 4 }}>Reference · {target.id}</div>
+            <div style={{ fontSize: 7, opacity: 0.45, lineHeight: 1.5, fontStyle: "italic" }}>{target.ref}</div>
+            <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+              <span style={{ cursor: "pointer", fontSize: 7, color: target.color, borderBottom: `1px dotted ${target.color}50` }} onClick={() => window.open(`https://pubmed.ncbi.nlm.nih.gov/${target.pmid}`, "_blank")}>PubMed ↗</span>
+              <span style={{ cursor: "pointer", fontSize: 7, color: target.color, borderBottom: `1px dotted ${target.color}50` }} onClick={() => window.open(`https://doi.org/${target.doi}`, "_blank")}>DOI ↗</span>
+              <span style={{ cursor: "pointer", fontSize: 7, color: target.color, borderBottom: `1px dotted ${target.color}50` }} onClick={() => window.open(`https://www.rcsb.org/structure/${target.pdb}`, "_blank")}>PDB ↗</span>
+              {dataSource === "ChEMBL" && selectedHit?.id?.startsWith("CHEMBL") && (
+                <span style={{ cursor: "pointer", fontSize: 7, color: "#78ff64", borderBottom: "1px dotted rgba(120,255,100,0.3)" }} onClick={() => window.open(`https://www.ebi.ac.uk/chembl/compound_report_card/${selectedHit.id}`, "_blank")}>{selectedHit.id} ↗</span>
+              )}
+            </div>
+          </div>
         </div>
 
         {/* ═══ CENTER ═══ */}
@@ -1588,58 +1646,6 @@ export default function ProteusVS() {
                 );
               })}
               <div style={{ fontSize: 6, opacity: 0.3, marginTop: 4 }}>Auto-checked on session start via RCSB API. Target list is static — new targets require code update.</div>
-            </div>
-          </div>
-
-          {/* Provenance */}
-          <div style={{ padding: "8px 10px", borderBottom: "1px solid rgba(255,255,255,0.07)", flexShrink: 0 }}>
-            <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.6, marginBottom: 4 }}>Provenance</div>
-            <div style={{ fontSize: 7, lineHeight: 1.8 }}>
-              {[
-                { l: "Targets", v: "RCSB PDB", ok: true },
-                { l: "Pharmacophore", v: pdbStatus[target.pdb]?.source === "PDB" ? "PDB" : "Lit", ok: true },
-                { l: "Compounds", v: dataSource === "ChEMBL" ? "ChEMBL" : "Synth", ok: dataSource === "ChEMBL" },
-                { l: "3D coords", v: "Approx", ok: false },
-                { l: "Validation", v: "Pending", ok: false },
-              ].map((d, i) => (
-                <div key={i} style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span style={{ opacity: 0.5 }}>{d.l}</span>
-                  <span style={{ color: d.ok ? "#78ff64" : "#ffc832" }}>{d.ok ? "✓" : "△"} {d.v}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Data Sources */}
-          <div style={{ padding: "8px 10px", borderBottom: "1px solid rgba(255,255,255,0.07)", flexShrink: 0 }}>
-            <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.6, marginBottom: 4 }}>Data Sources</div>
-            <div style={{ fontSize: 7, lineHeight: 1.6 }}>
-              {DATA_SOURCES.map((s, i) => (
-                <div key={i} style={{ marginBottom: 3 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ cursor: "pointer", color: "#50dcff", borderBottom: "1px dotted rgba(80,220,255,0.3)" }} onClick={() => window.open(s.url, "_blank")}>{s.name} ↗</span>
-                    <span style={{ fontSize: 6, opacity: 0.35 }}>{s.used}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Current target reference */}
-          <div style={{ padding: "8px 10px", borderBottom: "1px solid rgba(255,255,255,0.07)", flexShrink: 0 }}>
-            <div style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.6, marginBottom: 4 }}>Reference · {target.id}</div>
-            <div style={{ fontSize: 7, opacity: 0.45, lineHeight: 1.5, fontStyle: "italic" }}>{target.ref}</div>
-            <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
-              <span style={{ cursor: "pointer", fontSize: 7, color: target.color, borderBottom: `1px dotted ${target.color}50` }} onClick={() => window.open(`https://pubmed.ncbi.nlm.nih.gov/${target.pmid}`, "_blank")}>PubMed ↗</span>
-              <span style={{ cursor: "pointer", fontSize: 7, color: target.color, borderBottom: `1px dotted ${target.color}50` }} onClick={() => window.open(`https://doi.org/${target.doi}`, "_blank")}>DOI ↗</span>
-              <span style={{ cursor: "pointer", fontSize: 7, color: target.color, borderBottom: `1px dotted ${target.color}50` }} onClick={() => window.open(`https://www.rcsb.org/structure/${target.pdb}`, "_blank")}>PDB ↗</span>
-              {dataSource === "ChEMBL" && selectedHit?.id?.startsWith("CHEMBL") && (
-                <span style={{ cursor: "pointer", fontSize: 7, color: "#78ff64", borderBottom: "1px dotted rgba(120,255,100,0.3)" }} onClick={() => window.open(`https://www.ebi.ac.uk/chembl/compound_report_card/${selectedHit.id}`, "_blank")}>{selectedHit.id} ↗</span>
-              )}
-            </div>
-            <div style={{ fontSize: 6, opacity: 0.25, marginTop: 4, lineHeight: 1.4 }}>
-              Pharmacophore data {pdbStatus[target.pdb]?.source === "PDB" ? "extracted from PDB coordinates (auto-fetched on session start)" : "derived from published co-crystal analysis (hardcoded)"}.
-              Target list is static — new targets require code changes.
             </div>
           </div>
 
