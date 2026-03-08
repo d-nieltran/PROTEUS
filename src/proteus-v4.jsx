@@ -49,15 +49,15 @@ function getOptimalConfig(cores, memory, gpuLimits) {
 // TARGETS — real PDB co-crystal structures
 // ═══════════════════════════════════════════════════════════════════════════
 const TARGETS = [
-  { id:"PfDHFR", name:"P. falciparum DHFR-TS", disease:"Malaria", pdb:"1J3I", ligandId:"PYR", color:"#ff5078", pharmacophore:null,
-    ref:"Yuvaniyama J, et al. Insights into antifolate resistance from malarial DHFR-TS structures. Nat Struct Biol. 2003;10(5):357-365.",
-    pmid:"12704429", doi:"10.1038/nsb921", resolution:"2.33 Å",
-    cocrystal:"Cycloguanil (antifolate)", organism:"P. falciparum",
+  { id:"PfDHFR", name:"P. falciparum DHFR-TS", disease:"Malaria", pdb:"6A2M", ligandId:"9QR", color:"#ff5078", pharmacophore:null,
+    ref:"Yuthavong Y, et al. Malarial dihydrofolate reductase as a paradigm for drug development against a resistance-compromised target. Proc Natl Acad Sci. 2012;109(42):16823-16828.",
+    pmid:"23035243", doi:"10.1073/pnas.1204556109", resolution:"2.20 Å",
+    cocrystal:"BT2 hybrid DHFR inhibitor", organism:"P. falciparum",
     whyTarget:"DHFR is essential for folate biosynthesis in Plasmodium. Antifolate resistance mutations (S108N, N51I, C59R) reduce efficacy of pyrimethamine/cycloguanil, driving need for novel inhibitors." },
-  { id:"LmPTR1", name:"L. major PTR1", disease:"Leishmaniasis", pdb:"1E92", ligandId:"MTX", color:"#78ff64", pharmacophore:null,
+  { id:"LmPTR1", name:"L. major PTR1", disease:"Leishmaniasis", pdb:"1E7W", ligandId:"MTX", color:"#78ff64", pharmacophore:null,
     ref:"Gourley DG, et al. Pteridine reductase mechanism correlates pterin and folate metabolism with drug resistance in trypanosomatid parasites. Nat Struct Biol. 2001;8(6):521-525.",
-    pmid:"11373620", doi:"10.1038/88584", resolution:"2.20 Å",
-    cocrystal:"Methotrexate (antifolate)", organism:"L. major",
+    pmid:"11373620", doi:"10.1038/88584", resolution:"1.75 Å",
+    cocrystal:"Methotrexate (antifolate, Ki = 39 nM)", organism:"L. major",
     whyTarget:"PTR1 is unique to trypanosomatid parasites (absent in humans). It provides a metabolic bypass when DHFR is inhibited, making it essential for combination therapy strategies." },
   { id:"TcTR", name:"T. cruzi Trypanothione Red.", disease:"Chagas", pdb:"1BZL", ligandId:"QUN", color:"#50dcff", pharmacophore:null,
     ref:"Bond CS, et al. Crystal structure of Trypanosoma cruzi trypanothione reductase in complex with trypanothione, and the structure-based discovery of new natural product inhibitors. Structure. 1999;7(1):81-89.",
@@ -312,15 +312,17 @@ async function checkForBetterStructures(targets) {
   const results = {};
   for (const t of targets) {
     try {
-      // RCSB Search API — find structures for same protein with better resolution
+      // RCSB Search API — find structures for same organism+protein with better resolution
+      // Use organism filter + protein name in title to avoid false positives (e.g., DNA structures)
+      const proteinKeyword = t.id === "PfDHFR" ? "dihydrofolate reductase" : t.id === "LmPTR1" ? "pteridine reductase" : "trypanothione reductase";
       const searchPayload = {
         query: {
           type: "group",
           logical_operator: "and",
           nodes: [
-            { type: "terminal", service: "text", parameters: { attribute: "struct.title", operator: "contains_words", value: t.name.split(" ").slice(0, 3).join(" ") } },
+            { type: "terminal", service: "text", parameters: { attribute: "rcsb_entity_source_organism.ncbi_scientific_name", operator: "contains_words", value: t.organism } },
+            { type: "terminal", service: "text", parameters: { attribute: "struct.title", operator: "contains_words", value: proteinKeyword } },
             { type: "terminal", service: "text", parameters: { attribute: "rcsb_entry_info.resolution_combined", operator: "less_or_equal", value: 3.0 } },
-            { type: "terminal", service: "text", parameters: { attribute: "rcsb_entry_info.diffrn_resolution_high.value", operator: "exists" } },
           ]
         },
         return_type: "entry",
@@ -1641,7 +1643,7 @@ export default function ProteusVS() {
           </div>
 
           {/* BOTTOM: Hits Table */}
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
+          <div className="hits-table-wrap" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 10px", flexShrink: 0 }}>
               <span style={{ fontSize: 7, textTransform: "uppercase", letterSpacing: 2, opacity: 0.45 }}>Top Hits ({topHits.length})</span>
               <span style={{ fontSize: 7, opacity: 0.4 }}>Click row to view in 3D</span>
@@ -1897,15 +1899,17 @@ export default function ProteusVS() {
         ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.10);border-radius:2px;}
 
         @media(max-width:900px){
-          .proteus-root{overflow-y:auto !important;height:auto !important;min-height:100vh !important;}
-          .main-grid{grid-template-columns:1fr !important;grid-template-rows:auto 1fr auto !important;overflow-y:auto !important;}
-          .panel-left{border-right:none !important;border-bottom:1px solid rgba(255,255,255,0.07);max-height:none !important;overflow:visible !important;}
-          .panel-center{min-height:auto !important;}
-          .center-top{grid-template-columns:1fr !important;flex:none !important;height:auto !important;}
-          .center-top>div{min-height:200px;}
-          .center-mid{grid-template-columns:1fr !important;flex:none !important;height:auto !important;}
-          .center-mid>div{min-height:160px;}
-          .panel-right{border-left:none !important;border-top:1px solid rgba(255,255,255,0.07);overflow:visible !important;max-height:none !important;}
+          html,body{overflow:auto !important;height:auto !important;}
+          .proteus-root{overflow-y:auto !important;height:auto !important;min-height:100vh !important;overflow-x:hidden !important;}
+          .main-grid{display:flex !important;flex-direction:column !important;overflow:visible !important;min-height:auto !important;}
+          .panel-left{border-right:none !important;border-bottom:1px solid rgba(255,255,255,0.07);max-height:none !important;overflow:visible !important;flex:none !important;}
+          .panel-center{min-height:auto !important;overflow:visible !important;flex:none !important;}
+          .center-top{display:flex !important;flex-direction:column !important;flex:none !important;height:auto !important;overflow:visible !important;}
+          .center-top>div{min-height:200px;flex:none !important;}
+          .center-mid{display:flex !important;flex-direction:column !important;flex:none !important;height:auto !important;overflow:visible !important;}
+          .center-mid>div{min-height:160px;flex:none !important;}
+          .panel-right{border-left:none !important;border-top:1px solid rgba(255,255,255,0.07);overflow:visible !important;max-height:none !important;flex:none !important;}
+          .hits-table-wrap{flex:none !important;overflow:visible !important;min-height:auto !important;}
         }
 
         @media(max-width:600px){
